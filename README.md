@@ -39,6 +39,7 @@ Assistant is a modular, AI-powered desktop voice assistant that uses speech reco
 4. Install the required packages:
    ```
    pip install numpy torch transformers sounddevice bleak flask ollama
+   pip install 'accelerate>=0.26.0'
    ```
 
 5. Install system dependencies:
