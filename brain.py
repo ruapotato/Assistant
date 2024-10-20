@@ -105,12 +105,12 @@ User name: {context['user_name'] or 'Unknown'}
 Last calculation result: {context['last_result']}
 
 User request: {command}
-Respond using <say> tags for speech output. Use <type> tags when explicitly asked to type something or when the command starts with "Type".
-Always include both <say> and <type> tags when asked to type something.
+Be short and to the point. Respond using <say> tags for speech output. Use <type> tags when explicitly asked to type something or when the command starts with "Type".
 For example:
 - If asked "What's 5 times 5?", respond with: <say>5 times 5 is 25.</say>
-- If asked "Type the result of 5 times 5", respond with: <say>Certainly, I'll type that for you.</say><type>25</type>
-- If asked "Type, I love Molly Hamner", respond with: <say>Sure, I'll type that for you.</say><type>I love Molly Hamner</type>
+- If asked "Type the result of 5 times 5", respond with: <say>Sure!</say><type>25</type>
+- If asked "Type, I love Molly Hamner", respond with: <type>I love Molly Hamner</type>
+- If asked "Thank you.", respond with: <say>Happy to help!</say>
 """
 
     # Get response from Ollama

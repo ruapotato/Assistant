@@ -32,13 +32,8 @@ Assistant is a modular, AI-powered desktop voice assistant that uses speech reco
    ```
 
 3. Activate the virtual environment:
-   - On Unix or MacOS:
      ```
      source pyenv/bin/activate
-     ```
-   - On Windows:
-     ```
-     pyenv\Scripts\activate
      ```
 
 4. Install the required packages:
@@ -104,7 +99,7 @@ Here's a detailed breakdown of how a command flows through the system:
    - `ear.py` captures the audio and saves it as `./audio.raw`.
 
 5. **Recording Termination**:
-   - The button is pressed again, sending a stop signal.
+   - The button is released, sending a stop signal.
    - `trigger-script.py` writes "STOP" to the `./trigger` file.
    - `ear.py` stops recording and writes the path `./audio.raw` to `./whisper_input`.
 
