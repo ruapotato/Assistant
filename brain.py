@@ -14,7 +14,7 @@ YOLO = True
 CMD_history = []
 last_from_ai = ""
 
-# Updated evaluation prompt to better handle text summarization
+# Updated evaluation prompt to better handle typing commands
 evaluate_prompt = """You are a Linux System Analyzer that helps prepare context for command execution.
 Your job is to:
 1. Run specific commands to gather context based on the request
@@ -24,11 +24,13 @@ Common scenarios to handle:
 - For clipboard/highlighted text requests: Always run "xclip -o -selection primary" for highlighted text and "xclip -o -selection clipboard" for clipboard
 - For file info requests: Run "cat" or "ls" as needed
 - For system info requests: Run appropriate system commands
+- For transcription requests: Return transcribe mode with no commands
+- For typing requests: Check if command starts with "Type in" or similar phrases
 
 Output format must be JSON with:
 1. "commands": Array of commands to run
 2. "purpose": Brief description of what each command is for
-3. "mode": String indicating the type of operation ("summarize", "speak", "type", etc.)
+3. "mode": String indicating the type of operation ("summarize", "speak", "type", "transcribe", etc.)
 
 Example outputs:
 For "Summarize clipboard":
@@ -45,14 +47,38 @@ For "Tell me about file test.txt":
     "mode": "speak"
 }
 
-Must output valid JSON only - no other text."""
+For "Type in Hello world":
+{
+    "commands": [],
+    "purpose": "Typing text directly",
+    "mode": "type",
+    "text": "Hello world"
+}
 
-# Updated execution prompt to handle different modes
+For "Call me David":
+{
+    "commands": [],
+    "purpose": "NA",
+    "mode": "speak"
+}
+
+For "Transcribe what I say":
+{
+    "commands": [],
+    "purpose": "Ready to transcribe speech",
+    "mode": "transcribe"
+}
+
+Must output valid JSON only - no other text.
+For typing commands, extract the text after "Type in" and include it in the "text" field."""
+
+# Updated execution prompt to better handle typing mode
 execute_prompt = """You are a Linux Admin AI that helps users interact with their system.
 You must respond in one of these formats based on the context mode:
 
 For "speak" mode:
 espeak 'your message'
+espeak 'xclip -o output' # If asked to read selected
 
 For "summarize" mode:
 espeak "Here's the summary:"
@@ -64,18 +90,31 @@ For "type" mode:
 xdotool type "your text"
 xdotool key "Return"  # When needed
 
+For "transcribe" mode:
+xdotool type "Text to transcribe"
+xdotool key "Return"  # Add newline after transcription
+
 Rules:
 1. For summaries, break them into short, clear points that espeak can handle
 2. Never output raw text - always use espeak or xdotool
 3. Keep espeak messages under 100 characters for clarity
 4. For multi-line output use separate espeak commands
-5. Ensure proper command syntax and quoting
+5. For type mode, use the exact text provided in the context
+6. For transcribe mode, format the text naturally with proper capitalization and punctuation
 
 Example good summary output:
 espeak "Here's the summary of the text:"
 espeak "The story follows Arthur Dent escaping Earth's destruction"
 espeak "He joins his friend Ford Prefect on a galactic adventure"
 espeak "They discover the answer to life is 42"
+
+Example type mode output:
+xdotool type "Hello world"
+xdotool key "Return"
+
+Example transcribe output:
+xdotool type "Today I learned about quantum computing and its potential applications."
+xdotool key "Return"
 
 Never add explanations - only output valid commands."""
 
@@ -198,6 +237,10 @@ def evaluate_request(raw_cmd):
             "mode": eval_data.get("mode", "speak")  # Default to speak mode
         }
         
+        # Add text field for typing commands
+        if "text" in eval_data:
+            context["text"] = eval_data["text"]
+        
         if "commands" in eval_data:
             for cmd in eval_data["commands"]:
                 output = execute_command(cmd)
@@ -231,7 +274,7 @@ def process(raw_cmd):
     
     # Format context for execution phase
     execution_context = json.dumps(context, indent=2)
-    question = f"User CMD: {raw_cmd}\nContext: {execution_context}"
+    question = f"Context: {execution_context}\nUser CMD: {raw_cmd}"
     print(question)
     
     # Get AI response for execution
