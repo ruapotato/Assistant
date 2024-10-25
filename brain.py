@@ -2,8 +2,8 @@ import os
 import pwd
 import json
 import requests
-import pexpect
 import re
+import subprocess
 import time
 
 username = pwd.getpwuid(os.getuid()).pw_name
@@ -13,101 +13,128 @@ MODEL = "hf.co/bartowski/Replete-LLM-V2.5-Qwen-7b-GGUF:Q5_K_S"
 YOLO = True
 CMD_history = []
 last_from_ai = ""
-vert_term = None  # Global terminal variable
 
-# Updated system prompt to output only commands
-system_prompt = """You are a Linux Admin AI that ONLY responds with bash commands. Never add any explanation text.
-To speak, use: espeak 'your message'
-To execute system commands, just write the command
-To type something: xdotool type 'hello'
+# Updated evaluation prompt to better handle text summarization
+evaluate_prompt = """You are a Linux System Analyzer that helps prepare context for command execution.
+Your job is to:
+1. Run specific commands to gather context based on the request
+2. Return the commands and their expected outputs as structured data
 
-Examples of valid question -> responses:
-Call me David -> espeak 'Welcome David.'
-Type in a joke -> xdotool type "Your best joke"
-Tell me a joke -> espeak "Your best joke"
-Where am I -> espeak "you are in $(pwd)"
-Read highlighted text -> espeak "$(xclip -o)"
+Common scenarios to handle:
+- For clipboard/highlighted text requests: Always run "xclip -o -selection primary" for highlighted text and "xclip -o -selection clipboard" for clipboard
+- For file info requests: Run "cat" or "ls" as needed
+- For system info requests: Run appropriate system commands
 
-For multi line output use one xdotool command per line, with a `xdotool key "Return"` every ohter line. 
-xdotool type "Line one"
-xdotool key "Return"
-xdotool type "Line two"
-xdotool key "Return"
-xdotool type "Line three"
+Output format must be JSON with:
+1. "commands": Array of commands to run
+2. "purpose": Brief description of what each command is for
+3. "mode": String indicating the type of operation ("summarize", "speak", "type", etc.)
 
-Every response must be one or more bash commands.
-Never wrap commands in quotes unless part of the command syntax itself.
-Never add explanations - only output valid bash commands. 
-Prefer espeak to reply"""
+Example outputs:
+For "Summarize clipboard":
+{
+    "commands": ["xclip -o -selection clipboard"],
+    "purpose": "Getting clipboard content for summarization",
+    "mode": "summarize"
+}
 
-# Ensure voice directory exists
-os.makedirs(voice_dir, exist_ok=True)
+For "Tell me about file test.txt":
+{
+    "commands": ["cat test.txt"],
+    "purpose": "Reading file content",
+    "mode": "speak"
+}
 
-def start_terminal():
-    """Start a new bash session and return the terminal"""
-    global vert_term
-    vert_term = pexpect.spawn('bash', encoding='utf-8')
-    vert_term.expect('[$#] ')  # Wait for prompt
-    return vert_term
+Must output valid JSON only - no other text."""
+
+# Updated execution prompt to handle different modes
+execute_prompt = """You are a Linux Admin AI that helps users interact with their system.
+You must respond in one of these formats based on the context mode:
+
+For "speak" mode:
+espeak 'your message'
+
+For "summarize" mode:
+espeak "Here's the summary:"
+espeak 'First key point'
+espeak 'Second key point'
+[etc...]
+
+For "type" mode:
+xdotool type "your text"
+xdotool key "Return"  # When needed
+
+Rules:
+1. For summaries, break them into short, clear points that espeak can handle
+2. Never output raw text - always use espeak or xdotool
+3. Keep espeak messages under 100 characters for clarity
+4. For multi-line output use separate espeak commands
+5. Ensure proper command syntax and quoting
+
+Example good summary output:
+espeak "Here's the summary of the text:"
+espeak "The story follows Arthur Dent escaping Earth's destruction"
+espeak "He joins his friend Ford Prefect on a galactic adventure"
+espeak "They discover the answer to life is 42"
+
+Never add explanations - only output valid commands."""
 
 def execute_command(command):
-    """Execute a command in the terminal and return its output"""
-    global vert_term
-    if not vert_term:
-        return "Terminal not started"
-        
+    """Execute a command and return its output"""
     try:
-        # Send Ctrl+C to ensure clean prompt
-        vert_term.sendcontrol('c')
-        vert_term.expect('[$#] ', timeout=1)
-        
-        print(f"Executing: {command}")
-        vert_term.sendline(command)
-        
-        # For espeak commands, don't wait for output
+        # For espeak commands, execute without capturing output
         if command.startswith('espeak'):
-            time.sleep(0.1)  # Small delay to ensure command starts
-            vert_term.expect('[$#] ', timeout=1)
+            subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(0.5)  # Increased delay for better speech spacing
             return ""
             
-        # For xdotool commands, shorter timeout
+        # For xdotool commands, execute without capturing output
         elif command.startswith('xdotool'):
-            vert_term.expect('[$#] ', timeout=2)
+            subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(0.1)
             return ""
             
-        # For other commands, normal timeout
+        # For other commands, capture and return output
         else:
-            vert_term.expect('[$#] ', timeout=5)
-            # Skip the first line as it contains the command echo
-            output = vert_term.before.split('\n', 1)[1].rsplit('\n', 1)[0] if '\n' in vert_term.before else ""
-            return output.strip()
+            result = subprocess.run(command, shell=True, text=True, capture_output=True)
+            if result.returncode == 0:
+                return result.stdout.strip()
+            else:
+                return f"Error: {result.stderr.strip()}"
             
-    except pexpect.TIMEOUT:
-        # Don't treat timeout as error for espeak/xdotool
-        if command.startswith(('espeak', 'xdotool')):
-            return ""
+    except subprocess.TimeoutExpired:
         return "Command timed out"
-    except pexpect.EOF:
-        return "Terminal closed unexpectedly"
-    except Exception as e:
-        return f"Error: {str(e)}"
-            
-    except pexpect.TIMEOUT:
-        # Don't treat timeout as error for espeak/xdotool
-        if command.startswith(('espeak', 'xdotool')):
-            return ""
-        return "Command timed out"
-    except pexpect.EOF:
-        return "Terminal closed unexpectedly"
     except Exception as e:
         return f"Error: {str(e)}"
 
 def process_commands(text):
     """Process commands from AI response"""
-    # Split into individual commands if multiple are present
-    commands = re.split(r'(?<!&)(?<!&)\s*&&\s*|\s*;\s*', text.strip())
-    results = []
+    # Split commands while preserving quoted strings
+    commands = []
+    current_command = []
+    in_quotes = False
+    quote_char = None
     
+    for char in text:
+        if char in "\"'":
+            if not in_quotes:
+                in_quotes = True
+                quote_char = char
+            elif quote_char == char:
+                in_quotes = False
+                quote_char = None
+        elif char in ";\n" and not in_quotes:
+            current_command.append(char)
+            commands.append(''.join(current_command).strip())
+            current_command = []
+            continue
+        current_command.append(char)
+    
+    if current_command:
+        commands.append(''.join(current_command).strip())
+    
+    # Execute each command
+    results = []
     for command in commands:
         command = command.strip()
         if command:
@@ -155,17 +182,60 @@ def AI(command, system_prompt, context=None):
     except Exception as e:
         return f"Error processing request: {str(e)}"
 
+def evaluate_request(raw_cmd):
+    """Evaluate the request and gather necessary context"""
+    # Get evaluation from AI
+    evaluation = AI(raw_cmd, evaluate_prompt)
+    
+    try:
+        # Parse the evaluation JSON
+        eval_data = json.loads(evaluation)
+        
+        # Execute each command and gather results
+        context = {
+            "original_request": raw_cmd,
+            "command_outputs": {},
+            "mode": eval_data.get("mode", "speak")  # Default to speak mode
+        }
+        
+        if "commands" in eval_data:
+            for cmd in eval_data["commands"]:
+                output = execute_command(cmd)
+                context["command_outputs"][cmd] = output
+        
+        if "purpose" in eval_data:
+            context["purpose"] = eval_data["purpose"]
+            
+        return context
+        
+    except json.JSONDecodeError:
+        print(f"Error parsing evaluation JSON: {evaluation}")
+        return {
+            "original_request": raw_cmd,
+            "error": "Failed to parse evaluation response",
+            "mode": "speak"
+        }
+
 def process(raw_cmd):
     """Process a user command"""
     global last_from_ai, CMD_history
     CMD_history.append(raw_cmd)
     
-    context = format_context(CMD_history, last_from_ai)
-    question = f"User CMD: {raw_cmd}"
+    # First, evaluate the request and gather context
+    context = evaluate_request(raw_cmd)
+    
+    # Add command history to context
+    history_context = format_context(CMD_history, last_from_ai)
+    if history_context:
+        context['history'] = history_context
+    
+    # Format context for execution phase
+    execution_context = json.dumps(context, indent=2)
+    question = f"User CMD: {raw_cmd}\nContext: {execution_context}"
     print(question)
     
-    # Get AI response
-    response = AI(question, system_prompt, context=context)
+    # Get AI response for execution
+    response = AI(question, execute_prompt)
     print(f"Commands to execute: {response}")
     
     # Execute the commands
@@ -189,7 +259,6 @@ def format_context(cmd_history, last_reply):
 
 def main():
     """Main loop to process commands"""
-    start_terminal()
     process(f"Call me {username}")
     
     while YOLO:
@@ -201,12 +270,7 @@ def main():
                 process(cmd)
 
 if __name__ == "__main__":
-    cleanup_done = False
     try:
         main()
     except KeyboardInterrupt:
         print("\nShutting down...")
-    finally:
-        if vert_term and not cleanup_done:
-            vert_term.close()
-            cleanup_done = True
