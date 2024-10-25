@@ -21,6 +21,7 @@ Your job is to:
 2. Return the commands and their expected outputs as structured data
 
 Common scenarios to handle:
+- For Active app text which is normal to grab: Always run "import -window $(xdotool getactivewindow) png:- | tesseract stdin stdout"
 - For clipboard/highlighted text requests: Always run "xclip -o -selection primary" for highlighted text and "xclip -o -selection clipboard" for clipboard
 - For file info requests: Run "cat" or "ls" as needed
 - For system info requests: Run appropriate system commands
@@ -67,6 +68,18 @@ For "Transcribe what I say":
     "commands": [],
     "purpose": "Ready to transcribe speech",
     "mode": "transcribe"
+}
+For "Help me debug this":
+{
+    "commands": ["import -window $(xdotool getactivewindow) png:- | tesseract stdin stdout"],
+    "purpose": "Read the error in the active app",
+    "mode": "speak"
+}
+For "What do you think about this?":
+{
+    "commands": ["import -window $(xdotool getactivewindow) png:- | tesseract stdin stdout", "xclip -o -selection clipboard"],
+    "purpose": "Pull in data the user might be talking about",
+    "mode": "speak"
 }
 
 Must output valid JSON only - no other text.
