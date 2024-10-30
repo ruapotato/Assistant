@@ -154,42 +154,57 @@ def execute_bash(commands: str) -> Tuple[bool, str]:
     log(f"Executing bash commands:\n{commands}")
     
     try:
-        # Handle espeak commands specially
-        if commands.strip().startswith('espeak'):
-            cmd = commands.strip()
-            # Extract the text to speak
-            if '"' in cmd:
-                text = cmd.split('"')[1]  # Get text between quotes
-            elif "'" in cmd:
-                text = cmd.split("'")[1]  # Get text between single quotes
-            else:
-                text = cmd.replace('espeak', '').strip()
-            
-            # Execute espeak with cleaned text
-            result = subprocess.run(
-                ['espeak', text],
-                capture_output=True,
-                text=True
-            )
-            time.sleep(0.5)  # Wait for speech to complete
-            return result.returncode == 0, ""
-            
-        # For all other commands
-        result = subprocess.run(
-            commands,
-            shell=True,
-            executable='/bin/bash',
-            text=True,
-            capture_output=True,
-            timeout=TIMEOUT
-        )
+        # Split multiple commands and execute them sequentially
+        command_list = commands.strip().split('\n')
+        overall_success = True
+        combined_output = []
         
-        if result.stdout:
-            log(f"Command output: {result.stdout.strip()}")
-        if result.stderr:
-            log(f"Command error: {result.stderr.strip()}")
+        for cmd in command_list:
+            cmd = cmd.strip()
+            if not cmd:
+                continue
+                
+            # Handle espeak commands specially
+            if cmd.startswith('espeak'):
+                # Extract the text to speak
+                if '"' in cmd:
+                    text = cmd.split('"')[1]  # Get text between quotes
+                elif "'" in cmd:
+                    text = cmd.split("'")[1]  # Get text between quotes
+                else:
+                    text = cmd.replace('espeak', '').strip()
+                
+                # Execute espeak with cleaned text
+                result = subprocess.run(
+                    ['espeak', text],
+                    capture_output=True,
+                    text=True
+                )
+                success = result.returncode == 0
+                time.sleep(0.5)  # Wait for speech to complete
+                
+            else:
+                # For all other commands
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    executable='/bin/bash',
+                    text=True,
+                    capture_output=True,
+                    timeout=TIMEOUT
+                )
+                success = result.returncode == 0
+                if result.stdout:
+                    combined_output.append(result.stdout.strip())
             
-        return result.returncode == 0, result.stdout.strip()
+            if result.stderr:
+                log(f"Command error: {result.stderr.strip()}")
+            
+            overall_success = overall_success and success
+            if not success:
+                break
+                
+        return overall_success, '\n'.join(combined_output)
         
     except subprocess.TimeoutExpired:
         log(f"Command timed out after {TIMEOUT}s")
