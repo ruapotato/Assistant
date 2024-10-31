@@ -1,400 +1,182 @@
-#!/usr/bin/env python3
-
 import os
 import pwd
 import json
 import requests
-import subprocess
+import pexpect
+import re
 import time
-from typing import Optional, Dict, List, Union, Tuple
 
-# Constants
+username = pwd.getpwuid(os.getuid()).pw_name
+heard_file = "./heard"
+voice_dir = "./voice/"
 MODEL = "hf.co/bartowski/Replete-LLM-V2.5-Qwen-7b-GGUF:Q5_K_S"
-HEARD_FILE = "./heard"
-TIMEOUT = 10
-DEBUG = True
+YOLO = True
+CMD_history = []
+last_from_ai = ""
+vert_term = None
 
-# Global state
-CMD_history: List[str] = []
-last_output: str = ""
-active_window_id: Optional[str] = None
+# Updated system prompt with clearer instructions
+system_prompt = """You are a voice-controlled assistant that responds to commands and provides information.
+When responding:
+1. Use 'say:' for all user-directed communication
+2. Use 'run:' only when a command needs to be executed
+3. Wait for command output before providing analysis
+4. Never repeat or re-run commands that were just executed
+5. Keep responses concise and natural
+6. Don't announce command execution - just run them when needed
 
-# System prompts
-look_prompt = """You are a Linux Desktop and System Analyzer that gathers context for operations.
-Your job is to:
-1. Run specific commands to gather context based on the request
-2. Return the commands and their expected outputs as structured data
+Example good response to "list files":
+run: ls -al
 
-Common scenarios to handle:
-- For Active app/window operations:
-  * Get window info: "xdotool getactivewindow"
-  * Get window content: "import -window $(xdotool getactivewindow) png:- | tesseract stdin stdout"
-  * Get window name: "xdotool getwindowname $(xdotool getactivewindow)"
-  * Get window geometry: "xdotool getwindowgeometry $(xdotool getactivewindow)"
-  * List windows: "wmctrl -l"
+Example good response to command output:
+say: I see 5 Python files and 2 directories. The largest file is...
 
-- For workspace operations:
-  * List workspaces: "wmctrl -d"
-  * Get current workspace: "wmctrl -d | grep '*'"
+To get highlighted text use "xclip -o -selection primary"
+If asked to read selected text, start with the xclip command
+To minimize the active window, start by running "xdotool getactivewindow" then move onto using "xdotool windowminimize ID"
+If asked to type use xdotool, not espeak
+If asked to read use espeak, not xdotool
 
-- For screen operations:
-  * Get layout: "xrandr --current"
-  * Get dimensions: "xdpyinfo | grep dimensions"
+Remember: One say/run command per line, no explanations of what you're about to do. use 'say' most of the time"""
 
-- For clipboard/text operations:
-  * Get highlighted text: "xclip -o -selection primary"
-  * Get clipboard: "xclip -o -selection clipboard"
-  * Get file content: "cat [filename]"
+os.makedirs(voice_dir, exist_ok=True)
 
-Output format must be JSON with:
-1. "discovery_commands": Array of commands to gather needed info
-2. "purpose": What information we're trying to discover
-3. "operation": Type of operation (window, workspace, type, speak, summarize, transcribe)
-4. "text": Text to type (for typing operations)
-
-Example outputs:
-For "Move active window to desktop 3":
-{
-    "discovery_commands": [
-        "xdotool getactivewindow",
-        "wmctrl -d | grep '*'"
-    ],
-    "purpose": "Getting active window ID and workspace info",
-    "operation": "move_to_workspace"
-}
-
-For "Summarize clipboard":
-{
-    "discovery_commands": ["xclip -o -selection clipboard"],
-    "purpose": "Getting clipboard content for summarization",
-    "operation": "summarize"
-}
-
-For "Help me debug this":
-{
-    "discovery_commands": ["import -window $(xdotool getactivewindow) png:- | tesseract stdin stdout"],
-    "purpose": "Read the error in the active app",
-    "operation": "speak"
-}
-
-For "Type in Hello world":
-{
-    "discovery_commands": [],
-    "purpose": "Typing text directly",
-    "operation": "type",
-    "text": "Hello world"
-}
-
-Must output valid JSON only - no other text."""
-
-act_prompt = """You are a Linux Desktop Controller AI that executes operations.
-You receive discovery information and execute the appropriate commands.
-Current State:
-{state_info}
-
-
-IMPORTANT: Only output executable commands. No explanation text, no markdown, no backticks.
-
-Common operation types and their format:
-
-For speak operations:
-espeak 'your message'
-espeak 'command output'  # When reading discovered content
-
-For summarize operations:
-espeak "Here's the summary:"
-espeak 'First key point'
-espeak 'Second key point'
-
-For type operations:
-xdotool type "exact text from context"
-xdotool key "Return"  # When needed
-
-For window operations:
-WINDOW_ID=$(xdotool getactivewindow)
-xdotool windowsize $WINDOW_ID width height
-xdotool windowmove $WINDOW_ID x y
-espeak 'Window operation complete'
-
-For workspace operations:
-wmctrl -ir $WINDOW_ID -t workspace_number
-espeak 'Moved to workspace'
-
-Rules:
-1. Keep espeak messages under 100 characters
-2. Use variables for window IDs and dimensions
-3. Break long text into multiple espeak commands
-4. Quote all variable expansions
-5. For type mode, use exact text from context
-
-Example outputs:
-
-For window operation:
-WINDOW_ID=$(xdotool getactivewindow)
-xdotool windowminimize $WINDOW_ID
-espeak 'Window minimized'
-
-For summary:
-espeak "Here's what I found:"
-espeak "First important point from the text"
-espeak "Second key observation"
-espeak "Final conclusion"
-
-For typing:
-xdotool type "Hello world"
-xdotool key "Return"""
-
-def log(msg: str) -> None:
-    """Debug logging with timestamp"""
-    if DEBUG:
-        print(f"\nDEBUG [{time.strftime('%H:%M:%S')}]: {msg}")
-
-def execute_bash(commands: str) -> Tuple[bool, str]:
-    """Execute a sequence of bash commands"""
-    log(f"Executing bash commands:\n{commands}")
+def AI(command, system_prompt, context=None):
+    """Send a command to the AI model and get a response."""
+    if isinstance(context, str):
+        context_messages = [{"role": "user", "content": context}]
+    elif isinstance(context, list):
+        context_messages = context
+    else:
+        context_messages = []
     
-    try:
-        # Split multiple commands and execute them sequentially
-        command_list = commands.strip().split('\n')
-        overall_success = True
-        combined_output = []
-        
-        for cmd in command_list:
-            cmd = cmd.strip()
-            if not cmd:
-                continue
-                
-            # Handle espeak commands specially
-            if cmd.startswith('espeak'):
-                # Extract the text to speak
-                if '"' in cmd:
-                    text = cmd.split('"')[1]  # Get text between quotes
-                elif "'" in cmd:
-                    text = cmd.split("'")[1]  # Get text between quotes
-                else:
-                    text = cmd.replace('espeak', '').strip()
-                
-                # Execute espeak with cleaned text
-                result = subprocess.run(
-                    ['espeak', text],
-                    capture_output=True,
-                    text=True
-                )
-                success = result.returncode == 0
-                time.sleep(0.5)  # Wait for speech to complete
-                
-            else:
-                # For all other commands
-                result = subprocess.run(
-                    cmd,
-                    shell=True,
-                    executable='/bin/bash',
-                    text=True,
-                    capture_output=True,
-                    timeout=TIMEOUT
-                )
-                success = result.returncode == 0
-                if result.stdout:
-                    combined_output.append(result.stdout.strip())
-            
-            if result.stderr:
-                log(f"Command error: {result.stderr.strip()}")
-            
-            overall_success = overall_success and success
-            if not success:
-                break
-                
-        return overall_success, '\n'.join(combined_output)
-        
-    except subprocess.TimeoutExpired:
-        log(f"Command timed out after {TIMEOUT}s")
-        return False, "Command timed out"
-    except Exception as e:
-        log(f"Command failed: {str(e)}")
-        return False, str(e)
-
-def get_system_state() -> Dict:
-    """Gather current system state"""
-    state = {
-        "windows": [],
-        "current_dir": os.getcwd(),
-        "last_output": last_output,
-        "errors": []
-    }
-    
-    try:
-        # Get terminal windows
-        result = subprocess.run(
-            "xdotool search --class 'gnome-terminal|konsole|xfce4-terminal'",
-            shell=True,
-            text=True,
-            capture_output=True
-        )
-        
-        if result.stdout:
-            for window_id in result.stdout.strip().split('\n'):
-                try:
-                    name = subprocess.run(
-                        f"xdotool getwindowname {window_id}",
-                        shell=True,
-                        text=True,
-                        capture_output=True
-                    ).stdout.strip()
-                    
-                    state["windows"].append({
-                        "id": window_id,
-                        "name": name
-                    })
-                except:
-                    continue
-    except Exception as e:
-        state["errors"].append(f"Failed to get windows: {str(e)}")
-    
-    return state
-
-def query_ai(prompt: str, system_prompt: str, context: Optional[List[str]] = None) -> str:
-    """Query the AI model"""
-    if context is None:
-        context = []
-        
-    log(f"AI Query - Prompt: {prompt[:100]}...")
-    
-    context_msgs = [{"role": "user", "content": msg} for msg in context]
+    # Format context ensuring proper order of messages
     context_str = "\n".join([
         f"<|start_header_id|>{msg['role']}<|end_header_id|> {msg['content']}<|eot_id|>"
-        for msg in context_msgs
+        for msg in context_messages
     ])
     
-    full_prompt = f"""<|start_header_id|>system<|end_header_id|>{system_prompt}<|eot_id|>
+    prompt = f"""<|start_header_id|>system<|end_header_id|>{system_prompt}<|eot_id|>
 {context_str}
-<|start_header_id|>user<|end_header_id|>{prompt}<|eot_id|>
+<|start_header_id|>user<|end_header_id|>{command}<|eot_id|>
 <|start_header_id|>assistant<|end_header_id|>"""
 
     try:
-        response = requests.post(
-            'http://localhost:11434/api/generate',
+        response = requests.post('http://localhost:11434/api/generate',
             json={
                 "model": MODEL,
-                "prompt": full_prompt,
+                "prompt": prompt,
                 "stream": False,
                 "options": {
                     "stop": ["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
                     "num_predict": 8192
                 }
-            },
-            timeout=30
-        )
+            })
         
-        response.raise_for_status()
-        return response.json()['response'].strip()
-        
+        if response.status_code == 200:
+            return response.json()['response'].strip()
+        else:
+            return f"Error calling Ollama API: {response.status_code} - {response.text}"
     except Exception as e:
-        log(f"AI query failed: {str(e)}")
-        return ""
+        return f"Error processing request: {str(e)}"
 
-def format_context(cmd_history: List[str], last_output: str) -> List[str]:
-    """Format command history and output for context"""
+def say(a_thing_to_say):
+    """Write text to voice file with timestamp."""
+    timestamp = int(time.time() * 1000)
+    file_path = os.path.join(voice_dir, f"speech_{timestamp}.txt")
+    try:
+        with open(file_path, 'w') as f:
+            f.write(str(a_thing_to_say))
+    except Exception as e:
+        print(f"Error writing to voice file: {e}")
+
+def format_context(cmd_history):
+    """Format command history maintaining proper message order."""
     context = []
     
-    if cmd_history:
-        recent_cmds = "', '".join(cmd_history[-3:])
-        context.append(f"Recent commands: '{recent_cmds}'")
-    
-    if last_output:
-        context.append(f"Last output: {last_output}")
+    for entry in cmd_history:
+        # Add the user command first
+        if 'cmd' in entry:
+            context.append({
+                "role": "user",
+                "content": entry['cmd']
+            })
         
+        # Add command output if present
+        if 'stdout' in entry:
+            context.append({
+                "role": "stdout",
+                "content": entry['stdout']
+            })
+        
+        # Add AI response if present
+        if 'response' in entry:
+            context.append({
+                "role": "assistant",
+                "content": entry['response']
+            })
+    
     return context
 
-def look_and_act(cmd: str) -> str:
-    """Analyze environment and execute appropriate actions"""
-    global last_output, active_window_id
+def process(raw_cmd, cmd_data=False):
+    """Process commands while maintaining proper context and avoiding redundancy."""
+    global last_from_ai, CMD_history
     
-    # Get current system state
-    state = get_system_state()
-    context = format_context(CMD_history, last_output)
+    # Create new history entry
+    current_entry = {}
+    if cmd_data:
+        current_entry['stdout'] = raw_cmd
+    else:
+        current_entry['cmd'] = raw_cmd
     
-    # Look phase - analyze environment
-    look_result = query_ai(cmd, look_prompt, context)
-    try:
-        analysis = json.loads(look_result)
-        log(f"Environment analysis: {analysis}")
-        
-        # Act phase - get commands to execute
-        act_context = look_result  # Pass full analysis as context
-        commands = query_ai(
-            cmd,
-            act_prompt.format(state_info=json.dumps(analysis, indent=2)),
-            context + [act_context]
-        )
-        
-        if commands:
-            # Execute commands
-            success, output = execute_bash(commands)
-            if success:
-                last_output = output
-                
-                # Update active window if terminal operation
-                operation = analysis.get("operation", "")
-                if operation in ["terminal", "type"]:
-                    try:
-                        active_window_id = subprocess.run(
-                            "xdotool getactivewindow",
-                            shell=True,
-                            text=True,
-                            capture_output=True
-                        ).stdout.strip()
-                    except:
-                        pass
-            else:
-                subprocess.run(['espeak', 'Command failed'])
-                
-            return last_output
-            
-    except json.JSONDecodeError:
-        log("Failed to parse look response")
-        subprocess.run(['espeak', 'Failed to analyze environment'])
-    except Exception as e:
-        log(f"Look and act failed: {str(e)}")
-        subprocess.run(['espeak', 'Operation failed'])
-        
-    return last_output
-
-def process(cmd: str) -> str:
-    """Process a user command"""
-    global CMD_history
+    # Store last AI response before adding new command
+    if last_from_ai and CMD_history:
+        CMD_history[-1]['response'] = last_from_ai
     
-    log(f"Processing command: {cmd}")
-    CMD_history.append(cmd)
+    # Add new entry to history
+    CMD_history.append(current_entry)
     
-    return look_and_act(cmd)
+    # Get context and format question
+    context = format_context(CMD_history)
+    question = raw_cmd if cmd_data else f"User command: {raw_cmd}"
+    print(question)
+    
+    # Get AI response
+    response = AI(question, system_prompt, context=context)
+    print(response)
+    last_from_ai = response
+    
+    # Process response lines
+    for line in response.split("\n"):
+        line = line.strip()
+        if line.startswith("say:"):
+            say(line[4:].strip())
+        elif line.startswith("run:"):
+            cmd_output = os.popen(line[4:].strip()).read()
+            if cmd_output:
+                process(cmd_output, cmd_data=True)
+    
+    return response
 
 def main():
-    """Main loop"""
-    log("Starting desktop assistant")
-    username = pwd.getpwuid(os.getuid()).pw_name
+    """Main loop for processing voice commands."""
+    process(f"Call me {username}")
     
-    # Startup greeting
-    process(f"Your name is `computer` You are helping '{username}', say hi via espeak.")
-    
-    while True:
-        if os.path.exists(HEARD_FILE):
-            try:
-                with open(HEARD_FILE, "r") as f:
-                    cmd = f.read().strip()
-                os.remove(HEARD_FILE)
-                
-                if cmd:
-                    process(cmd)
-            except Exception as e:
-                log(f"Error processing command: {str(e)}")
-                subprocess.run(['espeak', 'Error processing command'])
-                
-        time.sleep(0.1)
+    while YOLO:
+        if os.path.exists(heard_file):
+            with open(heard_file, "r") as f:
+                cmd = f.read().strip()
+            os.remove(heard_file)
+            if cmd:
+                process(cmd)
 
 if __name__ == "__main__":
+    cleanup_done = False
     try:
         main()
     except KeyboardInterrupt:
         print("\nShutting down...")
-    except Exception as e:
-        print(f"Fatal error: {str(e)}")
+    finally:
+        if vert_term and not cleanup_done:
+            vert_term.close()
+            cleanup_done = True
