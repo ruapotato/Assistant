@@ -1,3 +1,4 @@
+# No longer developed, superseded by: https://github.com/ruapotato/Voice-Command
 # Assistant
 
 Assistant is a modular, AI-powered desktop voice assistant that uses speech recognition and natural language processing to execute commands and interact with your computer.
